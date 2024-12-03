@@ -133,6 +133,53 @@ def get_error_message(status_code):
 def index():
     return "Please navigate to /businesses to use this API"
 
+def build_next_url(offset, limit):
+    return f"http://localhost:8080/courses?limit={limit}&offset={offset}"
+
+@app.route('/courses', methods=['GET'])
+def get_courses():
+    # Get offset and limit from query parameters (default to 0 and 3 if not provided)
+    offset = int(request.args.get('offset', 0))
+    limit = int(request.args.get('limit', 3))
+
+    query = client.query(kind=COURSES)
+
+    # Sort by subject
+    query.order = ['subject']
+
+    # Set pagination
+    query.offset = offset
+    query.limit = limit
+
+    courses = list(query.fetch())
+
+    course_list = []
+    base_url = request.host_url.rstrip('/')
+
+    for course in courses:
+        course_data = {
+            'id': course.key.id,
+            'instructor_id': course['instructor_id'],
+            'number': course['number'],
+            "self": f"{base_url}/courses/{course.key.id}",
+            'subject': course['subject'],
+            'term': course['term'],
+            'title': course['title']
+        }
+        course_list.append(course_data)
+
+    next_offset = offset + limit
+    next_url = build_next_url(next_offset, limit) if len(courses) == limit else None
+
+    response = {
+        'courses': course_list
+    }
+
+    if next_url:
+        response['next'] = next_url
+
+    return jsonify(response), 200
+
 @app.route('/courses', methods=['POST'])
 def create_course():
     try:
