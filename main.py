@@ -1,5 +1,6 @@
-from flask import Flask, request, jsonify
-from google.cloud import datastore
+import io
+from flask import Flask, request, jsonify, send_file
+from google.cloud import datastore, storage
 
 import requests
 import json
@@ -10,6 +11,7 @@ from authlib.integrations.flask_client import OAuth
 
 USERS = 'users'
 COURSES = 'courses'
+AVATAR_BUCKET = 'm6_bowden_avatars'
 
 app = Flask(__name__)
 app.secret_key = 'SECRET_KEY'
@@ -134,27 +136,21 @@ def index():
     return "Please navigate to /businesses to use this API"
 
 def build_next_url(offset, limit):
-    return f"http://localhost:8080/courses?limit={limit}&offset={offset}"
+    return f"{request.host_url}courses?limit={limit}&offset={offset}"
 
 @app.route('/courses', methods=['GET'])
 def get_courses():
-    # Get offset and limit from query parameters (default to 0 and 3 if not provided)
     offset = int(request.args.get('offset', 0))
     limit = int(request.args.get('limit', 3))
 
     query = client.query(kind=COURSES)
-
-    # Sort by subject
     query.order = ['subject']
 
-    # Set pagination
-    query.offset = offset
-    query.limit = limit
-
-    courses = list(query.fetch())
+    courses = list(query.fetch(limit=limit, offset=offset))
 
     course_list = []
     base_url = request.host_url.rstrip('/')
+
 
     for course in courses:
         course_data = {
@@ -183,7 +179,7 @@ def get_courses():
 @app.route('/courses', methods=['POST'])
 def create_course():
     try:
-        #make sure role is admis
+        #make sure role is admin
         payload = verify_jwt(request)
         if not payload:
             raise ValueError(401)
@@ -253,6 +249,157 @@ def create_course():
         _, status_code = e.args
         return get_error_message(status_code), status_code
 
+@app.route('/courses/<int:course_id>', methods=['PATCH'])
+def update_course(course_id):
+    try:
+        # Ensure the user is an admin
+        payload = verify_jwt(request)
+        if not payload:
+            raise ValueError(401)
+
+        owner_sub = payload['sub']
+
+        query = client.query(kind=USERS)
+        query.add_filter('sub', '=', owner_sub)
+        results = query.fetch()
+
+        # Check if the user has an admin role
+        for entity in results:
+            role = entity.get('role')
+            if role != 'admin':
+                raise ValueError(403)
+
+        course_key = client.key(COURSES, course_id)
+        course_entity = client.get(course_key)
+
+        if not course_entity:
+            raise ValueError(403)  # Course not found
+
+        content = request.get_json()
+
+        updated_fields = {}
+        if 'subject' in content:
+            updated_fields['subject'] = content['subject']
+        if 'number' in content:
+            updated_fields['number'] = content['number']
+        if 'title' in content:
+            updated_fields['title'] = content['title']
+        if 'term' in content:
+            updated_fields['term'] = content['term']
+        if 'instructor_id' in content:
+            instructor_id = int(content['instructor_id'])
+
+            print(instructor_id)
+            # Make sure the instructor ID is valid
+            query = client.query(kind=USERS)
+            query.add_filter('role', '=', 'instructor')
+            instructors = list(query.fetch())
+            instructor_entity = next((entity for entity in instructors if entity.key.id == instructor_id), None)
+            if instructor_entity is None:
+                raise ValueError(400)
+
+            updated_fields['instructor_id'] = instructor_id
+
+        # Apply updates to the course entity
+        course_entity.update(updated_fields)
+        client.put(course_entity)
+
+        base_url = request.host_url.rstrip('/')
+        response = {
+            "id": course_entity.key.id,
+            "subject": course_entity.get("subject"),
+            "number": course_entity.get("number"),
+            "title": course_entity.get("title"),
+            "term": course_entity.get("term"),
+            "instructor_id": course_entity.get("instructor_id"),
+            "self": f"{base_url}/courses/{course_entity.key.id}"
+        }
+
+        return jsonify(response), 200
+
+    except ValueError as e:
+        status_code = int(str(e))
+        return get_error_message(status_code), status_code
+    except AuthError as e:
+        _, status_code = e.args
+        return get_error_message(status_code), status_code
+@app.route('/courses/<int:course_id>', methods=['DELETE'])
+def delete_course(course_id):
+    try:
+        payload = verify_jwt(request)
+        if not payload:
+            raise ValueError(401)
+
+        owner_sub = payload['sub']
+
+        query = client.query(kind=USERS)
+        query.add_filter('sub', '=', owner_sub)
+        results = query.fetch()
+
+        for entity in results:
+            role = entity.get('role')
+            if role != 'admin':
+                raise ValueError(403)
+
+        course_key = client.key(COURSES, course_id)
+        course = client.get(course_key)
+        if not course:
+            raise ValueError(403)
+
+        # Delete all students enrolled in the course
+        enrollment_query = client.query(kind=COURSES)
+        enrollment_query.add_filter('id', '=', course_id)
+        enrollments = list(enrollment_query.fetch())
+
+        for enrollment in enrollments:
+            client.delete(enrollment.key)  # Remove the enrollment record
+
+        instructor_id = course.get('instructor_id')
+        if instructor_id:
+            instructor_key = client.key(USERS, instructor_id)
+            instructor = client.get(instructor_key)
+            if instructor:
+                course_ids = instructor.get('course_ids', [])
+                if course_id in course_ids:
+                    course_ids.remove(course_id)
+                    instructor['course_ids'] = course_ids
+                    client.put(instructor)
+
+        client.delete(course_key)
+
+        return '', 204
+
+    except ValueError as e:
+        status_code = int(str(e))
+        return get_error_message(status_code), status_code
+    except AuthError as e:
+        _, status_code = e.args
+        return get_error_message(status_code), status_code
+
+@app.route('/courses/<int:course_id>', methods=['GET'])
+def get_course(course_id):
+    try:
+        course_key = client.key(COURSES, course_id)
+        course = client.get(course_key)
+
+        if not course:
+            raise ValueError(404)
+
+        course_data = {
+            'id': course.key.id,
+            'instructor_id': course['instructor_id'],
+            'number': course['number'],
+            'self': f"{request.host_url}courses/{course.key.id}",
+            'subject': course['subject'],
+            'term': course['term'],
+            'title': course['title']
+        }
+
+        return jsonify(course_data), 200
+    except ValueError as e:
+        status_code = int(str(e))
+        return get_error_message(status_code), status_code
+
 # Decode the JWT supplied in the Authorization header
 @app.route('/decode', methods=['GET'])
 def decode_jwt():
@@ -292,10 +439,6 @@ def login_user():
         return jsonify({"token": token}), 200
     except Exception as e:
         return {"error": f"An error occurred: {str(e)}"}, 500
-# # @app.route('/businesses/<int:business_id>', methods=['DELETE'])
-
-# @app.route('users/:id', methods = ['GET'])
-# def get_user():
 
 @app.route('/users', methods = ['GET'])
 def get_all_users():
@@ -336,6 +479,273 @@ def get_all_users():
     except AuthError as e:
         _, status_code = e.args
         return get_error_message(status_code), status_code
+
+@app.route('/users/<int:user_id>', methods=['GET'])
+def get_user(user_id):
+    try:
+    # Extract the JWT from the Authorization header
+        payload = verify_jwt(request)
+        if not payload:
+            raise ValueError(401)
+
+        user_key = client.key(USERS, user_id)
+        user = client.get(user_key)
+
+        if not user:
+            raise ValueError(403)
+
+        given_sub = payload['sub']
+        user_sub = (user.get('sub'))
+
+        # user_key = client.key(USERS, int(user_id))
+        # user = client.get(user_key)
+        # print(user)
+
+        # #check the auth sub on the jwt sent and attempted change are the same
+        # if user:
+        #     user_sub = (user.get('sub'))
+        #     if user_sub != owner_sub:
+        #         raise ValueError(403)
+        # else:
+        #     raise ValueError(403)
+
+        # Check if the JWT belongs to the user or if the user is an admin
+        if user_sub != given_sub and user.get("role") != "admin":
+            print('nope')
+            print(user_sub)
+            print(given_sub)
+            print(user.get('role'))
+            raise ValueError(403)
+
+        # Construct the response
+        response = {
+            "id": user_id,
+            "role": user["role"],
+            "sub": user["sub"]
+        }
+
+        base_url = request.host_url.rstrip('/')
+        # Add avatar_url if the user has an avatar
+        if user.get("avatar"):
+            response["avatar_url"] = f"{base_url}/users/{user_id}/avatar"
+
+        # Add courses if the user is an instructor or student
+        if user["role"] in ["instructor", "student"]:
+            response["courses"] = []
+            courses_query = client.query(kind=COURSES)
+
+            if user["role"] == "instructor":
+                courses_query.add_filter("instructor_id", "=", user_id)
+
+            elif user["role"] == "student":
+                courses_query.add_filter("students", "=", user_id)
+
+            for course in courses_query.fetch():
+                response["courses"].append(f"{base_url}/courses/{course.key.id}")
+
+        return jsonify(response), 200
+    except ValueError as e:
+        status_code = int(str(e))
+        return get_error_message(status_code), status_code
+    except AuthError as e:
+        _, status_code = e.args
+        return get_error_message(status_code), status_code
+
+@app.route('/users/<int:user_id>/avatar', methods=['GET'])
+def get_avatar(user_id):
+    try:
+        payload = verify_jwt(request)
+        if not payload:
+            raise ValueError(401)
+
+        # The sub on the jwt send in
+        owner_sub = payload['sub']
+
+        user_key = client.key(USERS, int(user_id))
+        user = client.get(user_key)
+        print(user)
+
+        #check the auth sub on the jwt sent and attempted change are the same
+        if user:
+            user_sub = (user.get('sub'))
+            if user_sub != owner_sub:
+                raise ValueError(403)
+        else:
+            raise ValueError(403)
+
+        file_name = user['avatar']
+        if not file_name:
+            raise ValueError(404)
+
+        storage_client = storage.Client()
+        bucket = storage_client.get_bucket(AVATAR_BUCKET)
+        # Create a blob with the given file name
+        blob = bucket.blob(file_name)
+        # Create a file object in memory using Python io package
+        file_obj = io.BytesIO()
+        # Download the file from Cloud Storage to the file_obj variable
+        blob.download_to_file(file_obj)
+        # Position the file_obj to its beginning
+        file_obj.seek(0)
+        # Send the object as a file in the response with the correct MIME type and file
+        # name
+        return send_file(file_obj, mimetype='image/png', download_name=file_name)
+
+    except ValueError as e:
+        status_code = int(str(e))
+        return get_error_message(status_code), status_code
+    except AuthError as e:
+        _, status_code = e.args
+        return get_error_message(status_code), status_code
+
+@app.route('/users/<int:user_id>/avatar', methods=['DELETE'])
+def delete_avatar(user_id):
+    try:
+        payload = verify_jwt(request)
+        if not payload:
+            raise ValueError(401)
+
+        owner_sub = payload['sub']
+
+        user_key = client.key(USERS, int(user_id))
+        user = client.get(user_key)
+
+        if not user:
+            raise ValueError(404)
+
+        user_sub = user.get('sub')
+        if user_sub != owner_sub:
+            raise ValueError(403)
+
+        # Check if the user has an avatar
+        file_name = user.get('avatar', '')
+        if not file_name:
+            raise ValueError(404)
+
+        storage_client = storage.Client()
+
+        storage_client = storage.Client()
+        bucket = storage_client.get_bucket(AVATAR_BUCKET)
+        blob = bucket.blob(file_name)
+
+        if not blob.exists():
+            raise ValueError(404)  # Avatar file does not exist
+
+        blob.delete()
+
+        user['avatar'] = ''
+        client.put(user)
+
+        return '', 204
+
+    except ValueError as e:
+        status_code = int(str(e))
+        return get_error_message(status_code), status_code
+    except AuthError as e:
+        _, status_code = e.args
+        return get_error_message(status_code), status_code
+
+@app.route('/users/<int:user_id>/avatar', methods=['POST'])
+def upload_user_avatar(user_id):
+    try:
+        if 'file' not in request.files:
+            print('nope')
+            raise ValueError(400)
+
+        file_obj = request.files['file']
+        print(file_obj)
+
+        payload = verify_jwt(request)
+        if not payload:
+            raise ValueError(401)
+
+        # The sub on the jwt send in
+        owner_sub = payload['sub']
+
+        user_key = client.key(USERS, int(user_id))
+        user = client.get(user_key)
+        print(user)
+
+        #check the auth sub on the jwt sent and attempted change are the same
+        if user:
+            user_sub = (user.get('sub'))
+            if user_sub != owner_sub:
+                raise ValueError(403)
+        else:
+            raise ValueError(403)
+
+        storage_client = storage.Client()
+        bucket = storage_client.get_bucket(AVATAR_BUCKET)
+        # Create a blob object for the bucket with the name of the file
+        blob = bucket.blob(file_obj.filename)
+        # Position the file_obj to its beginning
+        file_obj.seek(0)
+        # Upload the file into Cloud Storage
+        blob.upload_from_file(file_obj)
+
+        user['avatar'] = file_obj.filename
+        client.put(user)
+        base_url = request.host_url.rstrip('/')
+        return ({'avatar_url': f"{base_url}/users/{user_id}/avatar"},200)
+
+
+    except ValueError as e:
+        status_code = int(str(e))
+        return get_error_message(status_code), status_code
+    except AuthError as e:
+        _, status_code = e.args
+        return get_error_message(status_code), status_code
+# @app.route('/images', methods=['POST'])
+# def store_image():
+#     # Any files in the request will be available in request.files object
+#     # Check if there is an entry in request.files with the key 'file'
+#     if 'file' not in request.files:
+#         return ('No file sent in request', 400)
+#     # Set file_obj to the file sent in the request
+#     file_obj = request.files['file']
+#     # If the multipart form data has a part with name 'tag', set the
+#     # value of the variable 'tag' to the value of 'tag' in the request.
+#     # Note we are not doing anything with the variable 'tag' in this
+#     # example, however this illustrates how we can extract data from the
+#     # multipart form data in addition to the files.
+#     if 'tag' in request.form:
+#         tag = request.form['tag']
+#     # Create a storage client
+#     storage_client = storage.Client()
+#     # Get a handle on the bucket
+#     bucket = storage_client.get_bucket(PHOTO_BUCKET)
+#     # Create a blob object for the bucket with the name of the file
+#     blob = bucket.blob(file_obj.filename)
+#     # Position the file_obj to its beginning
+#     file_obj.seek(0)
+#     # Upload the file into Cloud Storage
+#     blob.upload_from_file(file_obj)
+#     return ({'file_name': file_obj.filename},201)
+
+# @app.route('/images/<file_name>', methods=['GET'])
+# def get_image(file_name):
+#     storage_client = storage.Client()
+#     bucket = storage_client.get_bucket(PHOTO_BUCKET)
+#     # Create a blob with the given file name
+#     blob = bucket.blob(file_name)
+#     # Create a file object in memory using Python io package
+#     file_obj = io.BytesIO()
+#     # Download the file from Cloud Storage to the file_obj variable
+#     blob.download_to_file(file_obj)
+#     # Position the file_obj to its beginning
+#     file_obj.seek(0)
+#     # Send the object as a file in the response with the correct MIME type and file
+#     # name
+#     return send_file(file_obj, mimetype='image/x-png', download_name=file_name)
+
+# @app.route('/images/<file_name>', methods=['DELETE'])
+# def delete_image(file_name):
+#     storage_client = storage.Client()
+#     bucket = storage_client.get_bucket(PHOTO_BUCKET)
+#     blob = bucket.blob(file_name)
+#     # Delete the file from Cloud Storage
+#     blob.delete()
+#     return '',204
 
 
 # @app.route('/businesses', methods=['GET'])
