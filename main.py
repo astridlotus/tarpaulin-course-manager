@@ -9,6 +9,7 @@ from jose import jwt
 from authlib.integrations.flask_client import OAuth
 
 USERS = 'users'
+COURSES = 'courses'
 
 app = Flask(__name__)
 app.secret_key = 'SECRET_KEY'
@@ -132,6 +133,79 @@ def get_error_message(status_code):
 def index():
     return "Please navigate to /businesses to use this API"
 
+@app.route('/courses', methods=['POST'])
+def create_course():
+    try:
+        #make sure role is admis
+        payload = verify_jwt(request)
+        if not payload:
+            raise ValueError(401)
+
+        owner_sub = payload['sub']
+
+        query = client.query(kind=USERS)
+        query.add_filter('sub', '=', owner_sub)
+        results = query.fetch()
+
+        for entity in results:
+            role = entity.get('role')
+            print(role)
+            if role != 'admin':
+                raise ValueError(403)
+
+        #check required fields in request
+        content = request.get_json()
+        required_fields = ["subject", "number", "title", "term", "instructor_id"]
+
+        if not content or any(field not in content for field in required_fields):
+            raise ValueError(400)
+
+        instructor_id = int(content['instructor_id']) #instructor to create course for
+
+        #make sure given instructor id is valid
+        query = client.query(kind=USERS)
+        query.add_filter('role', '=', 'instructor')
+        instructors = list(query.fetch())
+        instructor_entity = next((entity for entity in instructors if entity.key.id == instructor_id), None)
+        if instructor_entity is None:
+            raise ValueError(400)
+
+        #add the new course
+        course_key = client.key(COURSES)
+        course_entity = datastore.Entity(key=course_key)
+
+        course_entity.update({
+            "subject": content["subject"],
+            "number": content["number"],
+            "title": content["title"],
+            "term": content["term"],
+            "instructor_id": content["instructor_id"],
+        })
+
+        client.put(course_entity)
+
+        base_url = request.host_url.rstrip('/')
+        course_id = course_entity.key.id
+        response = {
+            "id": course_id,
+            "subject": content["subject"],
+            "number": content["number"],
+            "title": content["title"],
+            "term": content["term"],
+            "instructor_id": content["instructor_id"],
+            "self": f"{base_url}/courses/{course_id}"
+        }
+
+        return jsonify(response), 201
+
+
+    except ValueError as e:
+        status_code = int(str(e))
+        return get_error_message(status_code), status_code
+    except AuthError as e:
+        _, status_code = e.args
+        return get_error_message(status_code), status_code
+
 # Decode the JWT supplied in the Authorization header
 @app.route('/decode', methods=['GET'])
 def decode_jwt():
@@ -158,22 +232,23 @@ def login_user():
                 'client_id':CLIENT_ID,
                 'client_secret':CLIENT_SECRET
                 }
-        print(body)
+
         headers = { 'content-type': 'application/json' }
         url = 'https://' + DOMAIN + '/oauth/token'
 
         r = requests.post(url, json=body, headers=headers)
-        print(r)
-
 
         if r.status_code != 200:
             return ({"Error": "Unauthorized"}), 401
-
+        print(r.json())
         token = r.json().get('id_token')
-        print(token)
         return jsonify({"token": token}), 200
     except Exception as e:
         return {"error": f"An error occurred: {str(e)}"}, 500
+# # @app.route('/businesses/<int:business_id>', methods=['DELETE'])
+
+# @app.route('users/:id', methods = ['GET'])
+# def get_user():
 
 @app.route('/users', methods = ['GET'])
 def get_all_users():
@@ -182,7 +257,6 @@ def get_all_users():
         payload = verify_jwt(request)
         if not payload:  # Handle missing or invalid JWT
             raise ValueError(401)
-
 
         owner_sub = payload['sub']
 
@@ -215,6 +289,7 @@ def get_all_users():
     except AuthError as e:
         _, status_code = e.args
         return get_error_message(status_code), status_code
+
 
 # @app.route('/businesses', methods=['GET'])
 # def get_businesses():
