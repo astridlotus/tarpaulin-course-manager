@@ -127,6 +127,7 @@ def get_error_message(status_code):
         401: {"Error": "Unauthorized"},
         403: {"Error": "You don't have permission on this resource"},
         404: {"Error": "Not found"},
+        409: {"Error": "Enrollment data is invalid"}
     }
     return error_messages.get(status_code, {"Error": "Unknown error code"})
 
@@ -323,6 +324,122 @@ def update_course(course_id):
     except AuthError as e:
         _, status_code = e.args
         return get_error_message(status_code), status_code
+
+@app.route('/courses/<int:course_id>/students', methods=['GET'])
+def get_enrollment(course_id):
+    try:
+        # Verify the JWT
+        payload = verify_jwt(request)
+        if not payload:
+            raise ValueError(401)
+
+        owner_sub = payload['sub']
+
+        # Fetch course details
+        course_key = client.key(COURSES, course_id)
+        course = client.get(course_key)
+        if not course:
+            raise ValueError(403)
+
+        # Check if the user is an admin or the instructor of the course
+        query = client.query(kind=USERS)
+        query.add_filter('sub', '=', owner_sub)
+        user = list(query.fetch())
+        print(user)
+        print('hi')
+        print(user[0].key.id)
+
+        if not user:
+            raise ValueError(403)
+
+        user = user[0]
+        role = user.get('role')
+        user_id = user.key.id
+
+        # Check if the user is an admin or the instructor of the course
+        print(course['instructor_id'])
+        print(owner_sub)
+        if role != 'admin' and course['instructor_id'] != user_id:
+            raise ValueError(403)
+
+        # Get the list of enrolled students
+        enrolled_students = course.get('students', [])
+
+        # Return success response with the list of enrolled student IDs
+        return jsonify(enrolled_students), 200
+
+    except ValueError as e:
+        status_code = int(str(e))
+        return get_error_message(status_code), status_code
+    except AuthError as e:
+        _, status_code = e.args
+        return get_error_message(status_code), status_code
+
+@app.route('/courses/<int:course_id>/students', methods=['PATCH'])
+def update_enrollment(course_id):
+    try:
+        payload = verify_jwt(request)
+        if not payload:
+            raise ValueError(401)
+
+        owner_sub = payload['sub']
+
+        course_key = client.key(COURSES, course_id)
+        course = client.get(course_key)
+        if not course:
+            raise ValueError(403)
+
+        query = client.query(kind=USERS)
+        query.add_filter('sub', '=', owner_sub)
+        user = list(query.fetch())
+
+        if not user:
+            raise ValueError(403)
+
+        user = user[0]
+        role = user.get('role')
+
+
+        if role != 'admin' and course['instructor_id'] != owner_sub:
+            raise ValueError(403)
+
+        content = request.get_json()
+        add_students = content.get('add', [])
+        remove_students = content.get('remove', [])
+
+        if any(student_id in remove_students for student_id in add_students):
+            raise ValueError(409)
+
+        query = client.query(kind=USERS)
+        query.add_filter('role', '=', 'student')
+        students = {student.key.id: student for student in query.fetch()}
+
+        if not all(student_id in students for student_id in add_students + remove_students):
+            raise ValueError(409)
+
+        # Enroll students in the course
+        enrolled_students = set(course.get('students', []))
+        for student_id in add_students:
+            if student_id not in enrolled_students:
+                enrolled_students.add(student_id)
+
+        # Disenroll students from the course
+        for student_id in remove_students:
+            if student_id in enrolled_students:
+                enrolled_students.remove(student_id)
+
+        course['students'] = list(enrolled_students)
+        client.put(course)
+
+        return '', 200
+
+    except ValueError as e:
+        status_code = int(str(e))
+        return get_error_message(status_code), status_code
+    except AuthError as e:
+        _, status_code = e.args
+        return get_error_message(status_code), status_code
+
 @app.route('/courses/<int:course_id>', methods=['DELETE'])
 def delete_course(course_id):
     try:
